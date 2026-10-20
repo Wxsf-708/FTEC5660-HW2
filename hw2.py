@@ -68,6 +68,62 @@ async def load_mcp_tools() -> list[Any]:
     return await client.get_tools()
 
 
+SYSTEM_PROMPT = """You are a rigorous KYC / CV verification agent. Your job is to compare a job candidate's CV against their LinkedIn and Facebook profiles (served through the MCP tools) and output a reliability score in [0,1].
+
+## Step-by-step procedure
+
+1. READ THE CV. Extract from the CV text:
+   (a) full name, (b) city/country, (c) each job (company, title, start year, end year),
+   (d) each education entry (degree, school, field, graduation year), (e) every listed skill.
+
+2. IDENTIFY THE RIGHT PERSON. Names are shared by hundreds of people.
+   - Call search_linkedin_people with the candidate's name AND their city as the location filter.
+   - If multiple LinkedIn results come back, pick the one whose city, industry/headline, and career history best match the CV. Do NOT assume the first result is correct.
+   - Cross-check with Facebook: call search_facebook_users (display name + city), then get_facebook_profile. The Facebook original_name should match the LinkedIn name and the city should match. This confirms you found the right person.
+   - If you cannot confidently identify the unique correct person, output 0.2 (unverifiable).
+
+3. FETCH THE FULL PROFILE. Call get_linkedin_profile for the matched person_id. LinkedIn is the PRIMARY source. Facebook data agrees with LinkedIn and is used only for identity confirmation.
+
+4. FIELD-BY-FIELD COMPARISON. Check EVERY claim:
+   - Name: must match (display-name vs legal-name differences are OK).
+   - City: must match.
+   - Each job: company name, title, seniority, start year, end year.
+     * A start/end year off by even ONE year is a discrepancy.
+     * An inflated seniority (CV says "Senior" but LinkedIn seniority is junior; CV says "Manager" but LinkedIn says "Analyst") is a discrepancy.
+     * A different company name is a discrepancy.
+   - Each education: degree level (BSc / MSc / MBA / PhD must match), school name, field, graduation year.
+     * An upgraded degree (CV says PhD but LinkedIn says BSc) is a discrepancy.
+     * A wrong graduation year is a discrepancy.
+   - Skills: every skill on the CV must appear in the LinkedIn skills list.
+     * A skill on the CV that is NOT on LinkedIn is a discrepancy.
+     * The CV listing FEWER skills than LinkedIn is NOT a discrepancy.
+
+5. WHAT IS NOT A DISCREPANCY:
+   - Wording only: "Bachelor of Science" = BSc; "Master of Business Administration" = MBA; "UI/UX Design" = UI/UX.
+   - Job description bullet points, headline, summary, hometown.
+
+6. SCORE:
+   - EVERYTHING matches (allowing wording differences): output ~0.9.
+   - You found ONE OR MORE discrepancies (wrong year, inflated title, fake skill, wrong degree, wrong school, wrong company, wrong city): output ~0.1.
+   - Unsure but lean valid: 0.6. Unsure but lean discrepancy: 0.4.
+   - Cannot identify the person: 0.2.
+
+## OUTPUT FORMAT (ABSOLUTELY CRITICAL)
+Your final response must contain ONLY a single decimal number between 0 and 1 (e.g. 0.9 or 0.1).
+Do NOT write any explanation, do NOT mention any years, dates, names, companies, or other numbers.
+Just the number. Nothing else."""
+
+
+def _extract_score(text: Any) -> float:
+    """Pull a [0,1] score out of an agent response, ignoring years/other digits."""
+    nums = re.findall(r"-?\d+(?:\.\d+)?", str(text))
+    for n in nums:
+        v = float(n)
+        if 0.0 <= v <= 1.0:
+            return v
+    return 0.5
+
+
 def build_agent(tools: list[Any]) -> Any:
     """Create and return your agent once.
 
@@ -82,9 +138,12 @@ def build_agent(tools: list[Any]) -> Any:
     Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
     from .env.
     """
-    ### YOUR CODE HERE
-    _ = tools
-    return None
+    from langchain_deepseek import ChatDeepSeek
+    from langchain.agents import create_agent
+
+    model = ChatDeepSeek(model=MODEL_NAME, temperature=0.0)
+    agent = create_agent(model, tools=tools, system_prompt=SYSTEM_PROMPT)
+    return agent
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
@@ -105,9 +164,34 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     about 3 CVs in flight (e.g. with ``asyncio.Semaphore(3)``): the MCP server is
     shared by the whole class.
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    sem = asyncio.Semaphore(3)
+
+    async def _verify_one(name: str, text: str) -> tuple[str, float]:
+        async with sem:
+            try:
+                result = await agent.ainvoke(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Verify the following CV against the candidate's "
+                                    "LinkedIn and Facebook profiles. CV text:\n\n"
+                                    f"{text}"
+                                ),
+                            }
+                        ]
+                    }
+                )
+                last_msg = result["messages"][-1]
+                return name, _extract_score(last_msg.content)
+            except Exception:
+                # A failed API call / tool error -> low score (unverifiable).
+                return name, 0.1
+
+    tasks = [_verify_one(name, text) for name, text in cvs.items()]
+    results = await asyncio.gather(*tasks)
+    return dict(results)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
